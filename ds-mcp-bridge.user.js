@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DS MCP Bridge
 // @namespace    https://github.com/calendar0917/ds-enhance
-// @version      1.2.0
+// @version      2.0.0
 // @description  让 DeepSeek Chat 调用本地 MCP 工具（Shell、搜索等）
 // @author       ds-enhance
 // @match        https://chat.deepseek.com/*
@@ -17,9 +17,10 @@
 
   const SCRIPT_PREFIX = '[Bridge]';
   const DEFAULT_MCP_URL = 'http://localhost:8024/mcp';
+  const TOOL_CALL_RE = /```mcp:(\w+)\n([\s\S]*?)```/g;
 
   // ═══════════════════════════════════════════════════════════════
-  //  MCP Client (uses GM_xmlhttpRequest to bypass CORS)
+  //  MCP Client (GM_xmlhttpRequest to bypass CORS)
   // ═══════════════════════════════════════════════════════════════
   class MCPClient {
     constructor(url) {
@@ -36,30 +37,21 @@
           'Accept': 'application/json, text/event-stream',
         };
         if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
-
         GM_xmlhttpRequest({
-          method: 'POST',
-          url: this.url,
-          headers,
+          method: 'POST', url: this.url, headers,
           data: JSON.stringify(body),
           onload: (resp) => {
             try {
               const text = resp.responseText;
               if (resp.responseHeaders?.includes('text/event-stream')) {
-                const lines = text.split('\n');
-                for (const line of lines) {
-                  if (line.startsWith('data: ')) {
-                    resolve(JSON.parse(line.slice(6)));
-                    return;
-                  }
+                for (const line of text.split('\n')) {
+                  if (line.startsWith('data: ')) { resolve(JSON.parse(line.slice(6))); return; }
                 }
                 reject(new Error('No data in SSE response'));
               } else {
                 resolve(JSON.parse(text));
               }
-            } catch (e) {
-              reject(new Error(`Parse error: ${e.message}`));
-            }
+            } catch (e) { reject(new Error(`Parse error: ${e.message}`)); }
           },
           onerror: (e) => reject(new Error(`Network error: ${e.error || 'connection refused'}`)),
           ontimeout: () => reject(new Error('Request timed out')),
@@ -78,20 +70,15 @@
     async initialize() {
       try {
         const result = await this._rpc('initialize', {
-          protocolVersion: '2025-03-26',
-          capabilities: {},
-          clientInfo: { name: 'ds-mcp-bridge', version: '1.0.0' },
+          protocolVersion: '2025-03-26', capabilities: {},
+          clientInfo: { name: 'ds-mcp-bridge', version: '2.0.0' },
         });
         this.sessionId = result.sessionId;
         this.connected = true;
         await this._post({ jsonrpc: '2.0', method: 'notifications/initialized' });
         console.log(`${SCRIPT_PREFIX} MCP session initialized: ${this.sessionId}`);
         return true;
-      } catch (e) {
-        console.error(`${SCRIPT_PREFIX} Init failed:`, e.message);
-        this.connected = false;
-        return false;
-      }
+      } catch (e) { console.error(`${SCRIPT_PREFIX} Init failed:`, e.message); this.connected = false; return false; }
     }
 
     async listTools() {
@@ -109,22 +96,18 @@
       try {
         const resp = await new Promise((resolve, reject) => {
           GM_xmlhttpRequest({
-            method: 'GET',
-            url: this.url.replace('/mcp', '/health'),
+            method: 'GET', url: this.url.replace('/mcp', '/health'),
             onload: (r) => resolve(JSON.parse(r.responseText)),
-            onerror: (e) => reject(e),
-            timeout: 5000,
+            onerror: (e) => reject(e), timeout: 5000,
           });
         });
         return resp.status === 'ok';
-      } catch {
-        return false;
-      }
+      } catch { return false; }
     }
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  Tool Registry — fetched from server, injected into requests
+  //  Tool Registry & Hint Builder
   // ═══════════════════════════════════════════════════════════════
   let toolRegistry = [];
 
@@ -132,8 +115,7 @@
     if (!toolRegistry.length) return '';
     let hint = '[系统指令] 你拥有以下 MCP 工具。当用户的需求可以用工具完成时，你必须在回复中调用工具。';
     hint += ' 调用格式：用代码块写 ```mcp:工具名``` 后紧跟一个 JSON 代码块写参数。\n\n';
-    hint += '示例：\n';
-    hint += '```mcp:execute_command\n{"command": "ls -la"}\n```\n\n';
+    hint += '示例：\n```mcp:execute_command\n{"command": "ls -la"}\n```\n\n';
     hint += '可用工具列表：\n';
     toolRegistry.forEach(t => {
       hint += `- ${t.name}: ${t.description || ''}`;
@@ -144,17 +126,6 @@
     hint += '\n如果不需要工具就正常回答。需要工具时一定要调用。';
     return hint;
   }
-
-  // ═══════════════════════════════════════════════════════════════
-  //  Call history (shared with UI)
-  // ═══════════════════════════════════════════════════════════════
-  const callHistory = [];
-
-  // ═══════════════════════════════════════════════════════════════
-  //  XHR Hook — request injection only
-  //  Response is read via DOM observer instead.
-  // ═══════════════════════════════════════════════════════════════
-  const TOOL_CALL_RE = /```mcp:(\w+)\n([\s\S]*?)```/g;
 
   function injectHint(bodyStr) {
     if (!toolRegistry.length || !bodyStr) return bodyStr;
@@ -182,136 +153,123 @@
         }
       }
 
-      if (injected) {
-        console.log(`${SCRIPT_PREFIX} ✅ Tool hint injected`);
-        return JSON.stringify(parsed);
-      }
-    } catch (e) { /* not JSON */ }
+      if (injected) { console.log(`${SCRIPT_PREFIX} ✅ Tool hint injected`); return JSON.stringify(parsed); }
+    } catch { /* not JSON */ }
     return bodyStr;
   }
 
-  // Hook XHR for request injection
+  // ═══════════════════════════════════════════════════════════════
+  //  XHR Hook — SSE stream reading via progress events
+  //  Key insight from mcp-bridge: XHR 'progress' event fires during
+  //  SSE streaming and responseText IS accessible at that point.
+  //  (Unlike load/readystatechange which fire after stream ends.)
+  // ═══════════════════════════════════════════════════════════════
+  const callHistory = [];
+  const executedCalls = new Set();
+  let _streamContent = ''; // accumulates content across progress events
+  let _streamDebounce = null;
+
+  function checkForToolCalls(content) {
+    if (!content) return;
+    const re = new RegExp(TOOL_CALL_RE.source, 'g');
+    let match;
+    while ((match = re.exec(content)) !== null) {
+      const toolName = match[1];
+      const rawArgs = match[2].trim();
+      let args = {};
+      try { args = JSON.parse(rawArgs); }
+      catch { args = { input: rawArgs }; }
+
+      const key = toolName + ':' + JSON.stringify(args);
+      if (executedCalls.has(key)) continue;
+      executedCalls.add(key);
+
+      console.log(`${SCRIPT_PREFIX} 🔧 Tool call detected: ${toolName}`, args);
+      executeToolCall(toolName, args);
+    }
+  }
+
+  function parseSSEChunk(rawText) {
+    let content = '';
+    const lines = rawText.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const chunk = JSON.parse(data);
+          const c = chunk?.choices?.[0]?.delta?.content;
+          if (c) content += c;
+        } catch { /* skip */ }
+      }
+    }
+    return content;
+  }
+
   const XHRProto = unsafeWindow.XMLHttpRequest.prototype;
   const origOpen = XHRProto.open;
   const origSend = XHRProto.send;
+  const xhrMeta = new WeakMap();
 
   XHRProto.open = function (method, url, ...rest) {
-    this._dseUrl = url;
+    xhrMeta.set(this, { url, method, lastLen: 0 });
     return origOpen.apply(this, [method, url, ...rest]);
   };
 
   XHRProto.send = function (body) {
-    const url = this._dseUrl || '';
-    if (url.includes('completion') && body && toolRegistry.length) {
+    const meta = xhrMeta.get(this);
+    if (!meta) return origSend.apply(this, [body]);
+
+    const isCompletion = meta.url.includes('completion');
+
+    // Inject tool hint into outgoing request
+    if (isCompletion && body && toolRegistry.length) {
       body = injectHint(body);
     }
+
+    if (isCompletion) {
+      console.log(`${SCRIPT_PREFIX} XHR completion intercepted, setting up progress listener`);
+
+      // per-request accumulator (replaces global to avoid cross-request contamination)
+      let requestContent = '';
+      let requestLastLen = 0;
+
+      // progress event fires during SSE streaming — responseText is readable here!
+      this.addEventListener('progress', function () {
+        try {
+          const rt = this.responseText || '';
+          if (rt.length <= requestLastLen) return;
+          requestLastLen = rt.length;
+
+          // Parse full SSE response (idempotent — produces same result each time)
+          // This replaces previous accumulated content, not appends
+          requestContent = parseSSEChunk(rt);
+          _streamContent = requestContent; // update global for UI
+
+          // Debounce tool call check (avoid firing mid-token)
+          if (_streamDebounce) clearTimeout(_streamDebounce);
+          _streamDebounce = setTimeout(() => {
+            if (requestContent) checkForToolCalls(requestContent);
+          }, 1000);
+        } catch { /* responseText may throw during streaming on some browsers */ }
+      });
+
+      // Also check on load (stream complete)
+      this.addEventListener('load', function () {
+        try {
+          const rt = this.responseText || '';
+          if (rt.length > meta.lastLen) {
+            const remaining = parseSSEChunk(rt);
+            if (remaining) _streamContent += remaining;
+          }
+        } catch {}
+        if (_streamDebounce) clearTimeout(_streamDebounce);
+        checkForToolCalls(_streamContent);
+      });
+    }
+
     return origSend.apply(this, [body]);
   };
-
-  // ═══════════════════════════════════════════════════════════════
-  //  DOM Observer — detect tool calls from rendered chat
-  //
-  //  DeepSeek renders code blocks as <span class="hash"> text nodes,
-  //  NOT as <code> or <pre> elements. Tool names and JSON args may
-  //  also be split across sibling spans.
-  //
-  //  Strategy: use TreeWalker to find text nodes containing "mcp:xxx",
-  //  then collect adjacent text from the parent container to get
-  //  the full tool call (name + args JSON).
-  // ═══════════════════════════════════════════════════════════════
-  const executedCalls = new Set();
-
-  function callKey(name, args) {
-    return name + ':' + JSON.stringify(args);
-  }
-
-  function scanForToolCalls(root) {
-    if (!root || !root.querySelectorAll) return;
-
-    // Walk all text nodes looking for "mcp:toolname" pattern
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-    let node;
-    while ((node = walker.nextNode())) {
-      const text = node.textContent || '';
-
-      // Skip our own injected hint text
-      if (text.includes('[系统指令]') || text.includes('可用工具列表')) continue;
-
-      // Check if this text node contains a tool call: "mcp:some_tool_name"
-      const toolMatch = text.match(/\bmcp:(\w+)\b/);
-      if (!toolMatch) continue;
-
-      const toolName = toolMatch[1];
-
-      // Skip if this text node is part of a description line like
-      // "- execute_command: Execute a shell command"
-      // (descriptions have a colon-space after the tool name, not a newline or brace)
-      const afterTool = text.substring(text.indexOf('mcp:' + toolName));
-      if (afterTool.match(/^mcp:\w+:\s/)) continue; // "mcp:name: description" pattern
-
-      // Walk up the DOM to find a container that has both the tool name AND args.
-      // DeepSeek renders code blocks as nested <span> elements — the tool name
-      // and JSON args are in sibling spans under a common ancestor.
-      // IMPORTANT: in DOM, textContent concatenates without newlines, so
-      // "mcp:list_directory" + "{}" becomes "mcp:list_directory{}"
-      let container = node.parentElement;
-      let fullText = '';
-      for (let depth = 0; depth < 15 && container; depth++) {
-        fullText = container.textContent || '';
-        const hasTool = fullText.includes('mcp:' + toolName);
-        const hasArgs = fullText.includes('{') || fullText.includes('()');
-        if (hasTool && hasArgs) break;
-        // Also stop if we've reached a clearly distinct section (the hint text)
-        if (fullText.includes('[系统指令]') && fullText.includes('mcp:' + toolName)) {
-          // This container includes our hint — go back down
-          container = null;
-          break;
-        }
-        container = container.parentElement;
-      }
-
-      if (!container) continue;
-      fullText = container.textContent || '';
-
-      // Extract tool call from the concatenated text.
-      // After DOM concatenation: "mcp:tool_name{"arg":"val"}" or "mcp:tool_name{}"
-      // Also handle: "mcp:tool_name" (no args)
-      const callMatch = fullText.match(/mcp:(\w+)(\{[\s\S]*\})?/);
-      if (!callMatch) continue;
-
-      const detectedTool = callMatch[1];
-      const rawArgs = (callMatch[2] || '').trim();
-
-      let args = {};
-      if (rawArgs) {
-        try { args = JSON.parse(rawArgs); }
-        catch { args = { input: rawArgs }; }
-      }
-
-      const key = callKey(detectedTool, args);
-      if (executedCalls.has(key)) continue;
-      executedCalls.add(key);
-
-      console.log(`${SCRIPT_PREFIX} 🔧 Tool call detected: ${detectedTool}`, args);
-      executeToolCall(detectedTool, args);
-    }
-  }
-
-  waitForDOM().then(() => {
-    let scanTimer = null;
-    function scheduleScan() {
-      if (scanTimer) clearTimeout(scanTimer);
-      scanTimer = setTimeout(() => scanForToolCalls(document.body), 800);
-    }
-
-    const observer = new MutationObserver(() => scheduleScan());
-    observer.observe(document.body, { childList: true, subtree: true });
-
-    // Periodic safety net
-    setInterval(() => scanForToolCalls(document.body), 5000);
-
-    console.log(`${SCRIPT_PREFIX} DOM observer active`);
-  });
 
   // ═══════════════════════════════════════════════════════════════
   //  Tool Execution
@@ -325,18 +283,16 @@
     const record = { time: Date.now(), tool: toolName, args, status: 'running', result: null };
     callHistory.unshift(record);
     if (callHistory.length > 50) callHistory.pop();
-    window.dispatchEvent(new CustomEvent('dse-mcp-toolcall', { detail: record }));
+    unsafeWindow.dispatchEvent(new CustomEvent('dse-mcp-toolcall', { detail: record }));
 
     if (!autoExecute) {
       toast(`检测到工具调用: ${toolName}，请在面板中开启自动执行`, 'info');
-      console.log(`${SCRIPT_PREFIX} Tool call detected (auto-exec off): ${toolName}`, args);
+      console.log(`${SCRIPT_PREFIX} Tool call (auto-exec off): ${toolName}`, args);
       return;
     }
 
     try {
       toast(`调用工具: ${toolName}...`, 'info');
-      injectChatMessage(`🔧 正在调用 ${toolName}...`, 'pending');
-
       const result = await client.callTool(toolName, args);
       const resultText = result?.content?.[0]?.text || '(no result)';
       const isError = result?.isError;
@@ -344,135 +300,148 @@
       record.status = isError ? 'error' : 'success';
       record.result = resultText;
 
-      // Show result in chat UI
-      const prefix = isError ? '❌ 工具错误' : '✅ 工具结果';
-      injectChatMessage(`${prefix} (${toolName}):\n${resultText}`, isError ? 'error' : 'success');
-
       toast(`${isError ? '失败' : '成功'}: ${toolName}`, isError ? 'error' : 'success');
       console.log(`${SCRIPT_PREFIX} Tool result (${toolName}):`, resultText.substring(0, 500));
 
-      // Auto-send result back to DeepSeek for continued reasoning
+      // Inject result back into chat
       if (!isError) {
-        autoSendResult(toolName, resultText);
+        injectResultToChat(toolName, resultText);
+      } else {
+        injectResultToChat(toolName, `Error: ${resultText}`);
       }
 
     } catch (e) {
       record.status = 'error';
       record.result = e.message;
-      injectChatMessage(`❌ 工具调用失败 (${toolName}): ${e.message}`, 'error');
       toast(`工具调用失败: ${e.message}`, 'error');
       console.error(`${SCRIPT_PREFIX} Tool error:`, e);
+      injectResultToChat(toolName, `Error: ${e.message}`);
     }
   }
 
-  // ── Show tool result in chat UI ──
-  function injectChatMessage(text, type = 'info') {
-    const colors = {
-      pending: { bg: '#1a2a4a', border: '#2a4a6a', color: '#7aa2f7' },
-      success: { bg: '#0d2818', border: '#1a4a2a', color: '#6ee7b7' },
-      error:   { bg: '#2d0f0f', border: '#4a1a1a', color: '#fca5a5' },
-      info:    { bg: '#1a1a2e', border: '#2a2a3e', color: '#ccc' },
-    };
-    const c = colors[type] || colors.info;
+  // ═══════════════════════════════════════════════════════════════
+  //  Result Injection — based on mcp-bridge's input_injector.js
+  //
+  //  Wraps result in <tool_result> tags, injects into the chat
+  //  textarea/contenteditable, and simulates Enter to send.
+  //  The system prompt tells the AI to understand these tags.
+  // ═══════════════════════════════════════════════════════════════
+  function injectResultToChat(toolName, resultText) {
+    setTimeout(async () => {
+      const wrappedText = `<tool_result>\n${resultText}\n</tool_result>`;
 
-    const div = document.createElement('div');
-    div.className = 'dse-chat-message';
-    div.style.cssText = `
-      margin: 8px auto; padding: 12px 16px; border-radius: 10px;
-      background: ${c.bg}; border: 1px solid ${c.border};
-      color: ${c.color}; font-size: 13px; font-family: system-ui;
-      white-space: pre-wrap; word-break: break-word;
-      max-width: 720px; width: fit-content;
-    `;
-    div.textContent = text;
+      // Find input element
+      const input = findInputElement();
+      if (!input) {
+        console.log(`${SCRIPT_PREFIX} ⚠️ Could not find chat input element`);
+        toast('找不到聊天输入框', 'error');
+        return;
+      }
 
-    // Insert at the bottom of the chat message area
-    // DeepSeek renders messages in a scrollable container
-    const chatArea = findChatContainer();
-    if (chatArea) {
-      chatArea.appendChild(div);
-      // Scroll to bottom
-      chatArea.scrollTop = chatArea.scrollHeight;
-    } else {
-      // Fallback: append to body
-      document.body.appendChild(div);
-    }
-    console.log(`${SCRIPT_PREFIX} Chat message injected (${type})`);
+      console.log(`${SCRIPT_PREFIX} Found input: ${input.tagName} (contentEditable=${input.contentEditable})`);
+
+      // Focus
+      input.focus();
+      await sleep(200);
+
+      // Set value (handles both textarea and contenteditable)
+      setInputValue(input, wrappedText);
+      await sleep(500);
+
+      // Simulate Enter key to send
+      simulateEnter(input);
+      console.log(`${SCRIPT_PREFIX} ✅ Result injected and Enter sent`);
+
+      toast(`工具结果已发送给 DeepSeek`, 'success');
+    }, 1500);
   }
 
-  function findChatContainer() {
-    // Try multiple selectors for DeepSeek's chat message area
-    // The container is typically a scrollable div that holds all messages
-    const candidates = document.querySelectorAll('[class*="chat"] > div, [class*="message"] > div, main > div');
-    for (const el of candidates) {
-      // Heuristic: the chat container has many children (messages) and is scrollable
-      if (el.children.length > 2 && el.scrollHeight > el.clientHeight + 50) {
-        return el;
-      }
+  function findInputElement() {
+    // Try contenteditable first (DeepSeek likely uses this)
+    const editables = document.querySelectorAll('[contenteditable="true"]');
+    for (const el of editables) {
+      if (isVisible(el)) return el;
     }
-    // Fallback: find any element that looks like it contains messages
-    const scrollable = document.querySelectorAll('div');
-    for (const el of scrollable) {
-      const style = getComputedStyle(el);
-      if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-        if (el.scrollHeight > 400 && el.children.length > 1) {
-          return el;
-        }
-      }
+    // Fallback to textarea
+    const textareas = document.querySelectorAll('textarea');
+    for (const ta of textareas) {
+      if (isVisible(ta)) return ta;
+    }
+    // Generic fallbacks
+    const fallbacks = [
+      'textarea[placeholder*="输入"]', 'textarea[placeholder*="问"]',
+      'textarea', '[contenteditable="true"]', 'input[type="text"]',
+    ];
+    for (const sel of fallbacks) {
+      const el = document.querySelector(sel);
+      if (el && isVisible(el)) return el;
     }
     return null;
   }
 
-  // ── Auto-send tool result back to DeepSeek ──
-  function autoSendResult(toolName, resultText) {
-    // Wait a moment for the UI to settle, then type + send
-    setTimeout(() => {
-      const msg = `[MCP 工具结果 - ${toolName}]\n${resultText}\n\n请基于以上结果继续回答。`;
-
-      // Find the chat input (textarea or contenteditable div)
-      const textarea = document.querySelector('textarea');
-      if (textarea) {
-        // Set value using native setter to trigger React state update
-        const nativeSet = Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, 'value'
-        )?.set;
-        if (nativeSet) {
-          nativeSet.call(textarea, msg);
-          textarea.dispatchEvent(new Event('input', { bubbles: true }));
-          textarea.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
-          textarea.value = msg;
-          textarea.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        console.log(`${SCRIPT_PREFIX} Textarea filled, looking for send button...`);
-
-        // Find and click the send button
-        setTimeout(() => {
-          // Try multiple selectors for the send button
-          const btns = document.querySelectorAll('button');
-          for (const btn of btns) {
-            const ariaLabel = btn.getAttribute('aria-label') || '';
-            const title = btn.getAttribute('title') || '';
-            if (ariaLabel.includes('发送') || ariaLabel.includes('Send') ||
-                title.includes('发送') || title.includes('Send') ||
-                btn.querySelector('svg') && btn.closest('[class*="input"]')) {
-              btn.click();
-              console.log(`${SCRIPT_PREFIX} ✅ Send button clicked`);
-              return;
-            }
-          }
-          // Fallback: simulate Enter key on textarea
-          textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-          console.log(`${SCRIPT_PREFIX} Enter key simulated`);
-        }, 300);
-      } else {
-        console.log(`${SCRIPT_PREFIX} ⚠️ Could not find chat textarea`);
-      }
-    }, 1500);
+  function isVisible(el) {
+    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   }
 
+  function setInputValue(element, value) {
+    const isCE = element.contentEditable === 'true';
+
+    if (isCE) {
+      // contenteditable: use execCommand + InputEvent
+      element.focus();
+      const sel = unsafeWindow.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      element.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true, cancelable: true, inputType: 'insertText', data: value,
+      }));
+
+      try { document.execCommand('insertText', false, value); }
+      catch { element.textContent = value; }
+
+      // Move cursor to end
+      range.selectNodeContents(element);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } else {
+      // textarea: use native setter (React compatibility)
+      const setter = Object.getOwnPropertyDescriptor(
+        unsafeWindow.HTMLTextAreaElement.prototype, 'value'
+      )?.set || Object.getOwnPropertyDescriptor(
+        unsafeWindow.HTMLInputElement.prototype, 'value'
+      )?.set;
+
+      if (setter) setter.call(element, value);
+      else element.value = value;
+    }
+
+    // Fire all events
+    [
+      new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }),
+      new Event('change', { bubbles: true }),
+      new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Unidentified' }),
+      new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Unidentified' }),
+    ].forEach(e => element.dispatchEvent(e));
+  }
+
+  function simulateEnter(element) {
+    const init = {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      bubbles: true, cancelable: true,
+    };
+    element.dispatchEvent(new KeyboardEvent('keydown', init));
+    element.dispatchEvent(new KeyboardEvent('keypress', init));
+    element.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
   // ═══════════════════════════════════════════════════════════════
-  //  Toast (needed before DOM ready, lightweight)
+  //  Toast (lightweight, works before DOM ready)
   // ═══════════════════════════════════════════════════════════════
   function toast(msg, type = 'info') {
     if (!document.body) return;
@@ -485,24 +454,20 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  Load UI after DOM is ready
+  //  Load UI after DOM ready
   // ═══════════════════════════════════════════════════════════════
   function waitForDOM() {
-    return new Promise((resolve) => {
+    return new Promise(resolve => {
       if (document.body) resolve();
-      else {
-        const obs = new MutationObserver(() => {
-          if (document.body) { obs.disconnect(); resolve(); }
-        });
-        obs.observe(document.documentElement, { childList: true });
-      }
+      else new MutationObserver(() => { if (document.body) { resolve(); } })
+        .observe(document.documentElement, { childList: true });
     });
   }
 
   waitForDOM().then(initUI);
 
   // ═══════════════════════════════════════════════════════════════
-  //  UI
+  //  UI — Control Panel
   // ═══════════════════════════════════════════════════════════════
   function initUI() {
     autoExecute = GM_getValue('auto_execute', false);
@@ -563,8 +528,6 @@
       .dse-status-dot.green{background:#10b981}
       .dse-status-dot.red{background:#ef4444}
       .dse-status-dot.yellow{background:#f59e0b}
-
-      .dse-test-result{margin-top:10px;padding:10px;background:#1a1a28;border-radius:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;border:1px solid #2a2a3a}
     `;
     document.head.appendChild(style);
 
@@ -588,7 +551,6 @@
         <button data-tab="settings">设置</button>
       </div>
       <div class="dse-bd">
-        <!-- Status -->
         <div id="sec-status" class="dse-section active">
           <div id="mcp-conn-status" style="margin-bottom:12px;font-size:13px">
             <span class="dse-status-dot yellow"></span>检测中...
@@ -599,35 +561,23 @@
           </div>
           <div id="mcp-tools-list"></div>
         </div>
-
-        <!-- Test -->
         <div id="sec-test" class="dse-section">
-          <div style="color:#aaa;font-size:12px;margin-bottom:8px">手动测试工具调用（不依赖 AI）</div>
+          <div style="color:#aaa;font-size:12px;margin-bottom:8px">手动测试工具调用</div>
           <div style="margin-bottom:8px">
             <label style="font-size:12px;color:#888;display:block;margin-bottom:4px">工具名称</label>
-            <select id="test-tool" class="dse-input" style="padding:7px 10px;border-radius:8px;border:1px solid #444;background:#1a1a28;color:#eee;font-size:13px;outline:none">
-              <option value="">加载中...</option>
-            </select>
+            <select id="test-tool" class="dse-input" style="padding:7px 10px;border-radius:8px;border:1px solid #444;background:#1a1a28;color:#eee;font-size:13px;outline:none"><option value="">请先连接服务器</option></select>
           </div>
           <div style="margin-bottom:8px">
             <label style="font-size:12px;color:#888;display:block;margin-bottom:4px">参数 (JSON)</label>
             <textarea id="test-args" class="dse-input" rows="4" placeholder='{"command": "echo hello"}' style="resize:vertical;font-family:monospace"></textarea>
           </div>
-          <div class="dse-actions">
-            <button id="test-run" class="pri">执行</button>
-          </div>
+          <div class="dse-actions"><button id="test-run" class="pri">执行</button></div>
           <div id="test-result"></div>
         </div>
-
-        <!-- History -->
         <div id="sec-history" class="dse-section">
-          <div class="dse-actions">
-            <button id="hist-clear">清空历史</button>
-          </div>
+          <div class="dse-actions"><button id="hist-clear">清空历史</button></div>
           <div id="hist-list"></div>
         </div>
-
-        <!-- Settings -->
         <div id="sec-settings" class="dse-section">
           <div style="margin-bottom:12px">
             <label style="font-size:12px;color:#888;display:block;margin-bottom:4px">MCP 服务器地址</label>
@@ -636,15 +586,13 @@
           <div style="margin-bottom:12px">
             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
               <input type="checkbox" id="cfg-auto" ${autoExecute ? 'checked' : ''} style="width:16px;height:16px">
-              自动执行工具调用（不需确认）
+              自动执行工具调用
             </label>
             <div style="font-size:11px;color:#666;margin-top:4px;margin-left:24px">
-              开启后，AI 回复中包含的工具调用将自动执行
+              开启后，AI 输出中的工具调用将自动执行，结果会通过聊天输入框发回给 DeepSeek
             </div>
           </div>
-          <div class="dse-actions">
-            <button id="cfg-save" class="pri">保存设置</button>
-          </div>
+          <div class="dse-actions"><button id="cfg-save" class="pri">保存设置</button></div>
         </div>
       </div>
     `;
@@ -652,8 +600,6 @@
 
     // ── Drag ──
     let fabDragged = false, fabSX, fabSY, fabOX, fabOY;
-    const DRAG_TH = 5;
-
     function posPanel() {
       const r = fab.getBoundingClientRect();
       let l = r.left;
@@ -663,14 +609,13 @@
       panel.style.bottom = (innerHeight - r.top + 10) + 'px';
       panel.style.top = 'auto';
     }
-
     fab.addEventListener('pointerdown', (e) => {
       if (e.button) return;
       fabDragged = false; fabSX = e.clientX; fabSY = e.clientY;
       const r = fab.getBoundingClientRect();
       fabOX = e.clientX - r.left; fabOY = e.clientY - r.top;
       const mv = (e) => {
-        if (!fabDragged && Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) < DRAG_TH) return;
+        if (!fabDragged && Math.abs(e.clientX - fabSX) + Math.abs(e.clientY - fabSY) < 5) return;
         fabDragged = true;
         fab.style.left = Math.max(0, Math.min(innerWidth - 48, e.clientX - fabOX)) + 'px';
         fab.style.top = Math.max(0, Math.min(innerHeight - 48, e.clientY - fabOY)) + 'px';
@@ -686,12 +631,11 @@
       document.addEventListener('pointerup', up);
       e.preventDefault();
     });
-
     fab.style.left = '80px';
     fab.style.top = (innerHeight - 68) + 'px';
     panel.querySelector('.cls').onclick = () => panel.classList.remove('open');
 
-    // ── Tab switching ──
+    // ── Tabs ──
     panel.querySelectorAll('#dse-tabs button').forEach(btn => {
       btn.onclick = () => {
         panel.querySelectorAll('#dse-tabs button').forEach(b => b.classList.remove('active'));
@@ -711,178 +655,103 @@
     async function refreshStatus() {
       const url = panel.querySelector('#cfg-url')?.value || GM_getValue('mcp_url', DEFAULT_MCP_URL);
       const client = new MCPClient(url);
-
       statusEl.innerHTML = '<span class="dse-status-dot yellow"></span>检测中...';
       toolsListEl.innerHTML = '';
-
       const healthy = await client.checkHealth();
       if (!healthy) {
         statusEl.innerHTML = '<span class="dse-status-dot red"></span>服务器未连接（请确保 server.py 正在运行）';
-        fab.className = 'disconnected';
-        toolRegistry = [];
-        updateTestToolSelect();
-        return;
+        fab.className = 'disconnected'; toolRegistry = []; updateTestSelect(); return;
       }
-
       try {
         await client.initialize();
         const tools = await client.listTools();
-        toolRegistry = tools; // Store globally for fetch hook
+        toolRegistry = tools;
         statusEl.innerHTML = `<span class="dse-status-dot green"></span>已连接 (${tools.length} 个工具)`;
         fab.className = 'connected';
-
         tools.forEach(t => {
           const card = document.createElement('div');
           card.className = 'dse-tool-card';
           card.innerHTML = `<h4>${t.name}</h4><p>${t.description || ''}</p>`;
           toolsListEl.appendChild(card);
         });
-
-        updateTestToolSelect();
+        updateTestSelect();
       } catch (e) {
         statusEl.innerHTML = `<span class="dse-status-dot red"></span>连接失败: ${e.message}`;
-        fab.className = 'disconnected';
-        toolRegistry = [];
-        updateTestToolSelect();
+        fab.className = 'disconnected'; toolRegistry = []; updateTestSelect();
       }
     }
-
     panel.querySelector('#mcp-connect').onclick = refreshStatus;
     panel.querySelector('#mcp-refresh').onclick = refreshStatus;
 
-    // ── Manual Test ──
+    // ── Test ──
     const testToolSelect = panel.querySelector('#test-tool');
     const testArgsInput = panel.querySelector('#test-args');
     const testResultEl = panel.querySelector('#test-result');
 
-    function updateTestToolSelect() {
+    function updateTestSelect() {
       testToolSelect.innerHTML = '';
-      if (!toolRegistry.length) {
-        testToolSelect.innerHTML = '<option value="">请先连接服务器</option>';
-        return;
-      }
+      if (!toolRegistry.length) { testToolSelect.innerHTML = '<option value="">请先连接服务器</option>'; return; }
       toolRegistry.forEach(t => {
         const opt = document.createElement('option');
-        opt.value = t.name;
-        opt.textContent = `${t.name} — ${t.description || ''}`;
+        opt.value = t.name; opt.textContent = `${t.name} — ${t.description || ''}`;
         testToolSelect.appendChild(opt);
       });
-      // Auto-fill example args for first tool
-      autoFillTestArgs();
     }
-
-    function autoFillTestArgs() {
-      const toolName = testToolSelect.value;
-      const tool = toolRegistry.find(t => t.name === toolName);
-      if (!tool) return;
-      const example = {};
-      const props = tool.inputSchema?.properties || {};
-      for (const [key, val] of Object.entries(props)) {
-        if (val.type === 'string') example[key] = '';
-        else if (val.type === 'integer') example[key] = 0;
-      }
-      testArgsInput.value = JSON.stringify(example, null, 2);
-      testArgsInput.placeholder = `参数: ${Object.keys(props).join(', ') || '无参数'}`;
-    }
-
-    testToolSelect.onchange = autoFillTestArgs;
 
     panel.querySelector('#test-run').onclick = async () => {
       const toolName = testToolSelect.value;
       if (!toolName) { toast('请先连接服务器', 'error'); return; }
-
       let args = {};
       const raw = testArgsInput.value.trim();
-      if (raw) {
-        try { args = JSON.parse(raw); }
-        catch (e) { toast(`JSON 格式错误: ${e.message}`, 'error'); return; }
-      }
-
+      if (raw) { try { args = JSON.parse(raw); } catch (e) { toast(`JSON 错误: ${e.message}`, 'error'); return; } }
       testResultEl.innerHTML = '<div style="color:#888">执行中...</div>';
-      const mcpUrl = GM_getValue('mcp_url', DEFAULT_MCP_URL);
-      const client = new MCPClient(mcpUrl);
-
-      const record = { time: Date.now(), tool: toolName, args, status: 'running', result: null };
-      callHistory.unshift(record);
-
       try {
+        const client = new MCPClient(GM_getValue('mcp_url', DEFAULT_MCP_URL));
         const result = await client.callTool(toolName, args);
-        const resultText = result?.content?.[0]?.text || '(no result)';
-        const isError = result?.isError;
-
-        record.status = isError ? 'error' : 'success';
-        record.result = resultText;
-
-        testResultEl.innerHTML = `<div style="color:${isError ? '#fca5a5' : '#6ee7b7'}">${esc(resultText)}</div>`;
-        toast(isError ? '工具返回错误' : '执行成功', isError ? 'error' : 'success');
+        const text = result?.content?.[0]?.text || '(no result)';
+        const err = result?.isError;
+        testResultEl.innerHTML = `<div style="color:${err ? '#fca5a5' : '#6ee7b7'}">${esc(text)}</div>`;
+        toast(err ? '工具返回错误' : '执行成功', err ? 'error' : 'success');
       } catch (e) {
-        record.status = 'error';
-        record.result = e.message;
         testResultEl.innerHTML = `<div style="color:#fca5a5">Error: ${esc(e.message)}</div>`;
-        toast(`执行失败: ${e.message}`, 'error');
+        toast(`失败: ${e.message}`, 'error');
       }
     };
 
     // ── History ──
     const histListEl = panel.querySelector('#hist-list');
-
     function renderHistory() {
       histListEl.innerHTML = '';
-      if (!callHistory.length) {
-        histListEl.innerHTML = '<div style="color:#555;font-size:13px;padding:12px 0">暂无调用记录</div>';
-        return;
-      }
+      if (!callHistory.length) { histListEl.innerHTML = '<div style="color:#555;font-size:13px;padding:12px 0">暂无记录</div>'; return; }
       callHistory.forEach(r => {
-        const item = document.createElement('div');
-        item.className = 'dse-log-item';
-        const time = new Date(r.time);
-        const timeStr = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}:${String(time.getSeconds()).padStart(2, '0')}`;
-        item.innerHTML = `
-          <div class="log-head">
-            <span class="log-tool">${r.tool}</span>
-            <span>
-              <span class="log-status ${r.status}">${r.status}</span>
-              <span class="log-time">${timeStr}</span>
-            </span>
-          </div>
-          <div class="log-args">${esc(JSON.stringify(r.args))}</div>
-          ${r.result ? `<div class="log-args" style="margin-top:4px;color:#6ee7b7">${esc(r.result.substring(0, 200))}</div>` : ''}
-        `;
+        const item = document.createElement('div'); item.className = 'dse-log-item';
+        const t = new Date(r.time);
+        const ts = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`;
+        item.innerHTML = `<div class="log-head"><span class="log-tool">${r.tool}</span><span><span class="log-status ${r.status}">${r.status}</span> <span class="log-time">${ts}</span></span></div><div class="log-args">${esc(JSON.stringify(r.args))}</div>${r.result ? `<div class="log-args" style="margin-top:4px;color:#6ee7b7">${esc(r.result.substring(0, 200))}</div>` : ''}`;
         histListEl.appendChild(item);
       });
     }
-
     panel.querySelector('#hist-clear').onclick = () => { callHistory.length = 0; renderHistory(); };
-
-    window.addEventListener('dse-mcp-toolcall', () => {
-      if (panel.querySelector('#sec-history.active')) renderHistory();
-    });
 
     // ── Settings ──
     panel.querySelector('#cfg-save').onclick = () => {
-      const url = panel.querySelector('#cfg-url').value.trim();
-      const auto = panel.querySelector('#cfg-auto').checked;
-      GM_setValue('mcp_url', url);
-      GM_setValue('auto_execute', auto);
-      autoExecute = auto;
-      toast('设置已保存', 'success');
-      refreshStatus();
+      GM_setValue('mcp_url', panel.querySelector('#cfg-url').value.trim());
+      GM_setValue('auto_execute', panel.querySelector('#cfg-auto').checked);
+      autoExecute = panel.querySelector('#cfg-auto').checked;
+      toast('设置已保存', 'success'); refreshStatus();
     };
 
-    // ── Keyboard shortcut ──
+    // ── Keyboard ──
     document.addEventListener('keydown', (e) => {
       if (e.ctrlKey && e.shiftKey && e.key === 'M') {
-        e.preventDefault();
-        panel.classList.toggle('open');
+        e.preventDefault(); panel.classList.toggle('open');
         if (panel.classList.contains('open')) posPanel();
       }
     });
 
-    // ── Init ──
     setTimeout(refreshStatus, 1000);
 
     function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-
-    console.log(`${SCRIPT_PREFIX} DS MCP Bridge v1.1.0 loaded — Ctrl+Shift+M or 绿色按钮`);
+    console.log(`${SCRIPT_PREFIX} DS MCP Bridge v2.0.0 loaded — Ctrl+Shift+M or 绿色按钮`);
   }
 })();
