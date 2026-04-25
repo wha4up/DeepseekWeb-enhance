@@ -76,6 +76,14 @@ python server.py
 
 **快捷键：** `Ctrl+Shift+M` 切换面板
 
+### 面板功能
+
+| Tab | 说明 |
+|-----|------|
+| **状态** | 连接状态、已注册工具列表，支持重试/刷新 |
+| **测试** | 选择工具 → 自动显示参数表单 → 执行 → 查看结果 |
+| **设置** | MCP 服务器地址配置 |
+
 ### 内置工具
 
 | 工具 | 说明 |
@@ -106,7 +114,7 @@ python server.py
 ```
 ds-enhance/
 ├── ds-enhance.user.js      # 油猴脚本 — 对话管理增强 (~960 行)
-├── ds-mcp-bridge.user.js   # 油猴脚本 — MCP 工具桥接 (~500 行)
+├── ds-mcp-bridge.user.js   # 油猴脚本 — MCP 工具桥接 (~800 行)
 ├── shared/
 │   └── shared-header.js    # 共享基础设施（FAB、面板、toast、工具函数）
 ├── server/                 # MCP 服务器端
