@@ -105,7 +105,7 @@ python server.py
 
 ```
 ds-enhance/
-├── ds-enhance.user.js      # 油猴脚本 — 对话管理增强 (~950 行)
+├── ds-enhance.user.js      # 油猴脚本 — 对话管理增强 (~960 行)
 ├── ds-mcp-bridge.user.js   # 油猴脚本 — MCP 工具桥接 (~500 行)
 ├── shared/
 │   └── shared-header.js    # 共享基础设施（FAB、面板、toast、工具函数）
@@ -136,8 +136,9 @@ ds-enhance/
 - [ ] 批量操作失败重试机制
 
 ### DS MCP Bridge
-- [ ] SSE 拦截 PoC 实测验证
-- [ ] 工具调用结果自动注入对话
+- [x] SSE 拦截（DeepSeek 原生 SSE 格式 + OpenAI 兼容格式）
+- [x] 工具调用检测（正则 + flex match 双策略）
+- [x] 工具调用结果自动注入对话
 - [ ] 工具白名单/黑名单
 - [ ] 支持外部 MCP 服务器（stdio 传输）
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.0.0-mcp] - 2025-04-25
+
+### Added
+- DeepSeek 原生 SSE 格式解析（`p`/`v` 字段），兼容 OpenAI 格式
+- Flex match 工具调用检测：支持 SSE token 边界截断情况下的模糊匹配
+- 工具结果自动注入：执行结果通过聊天输入框发回给 DeepSeek
+- `<tool_result>` 标签系统提示，引导 AI 理解工具结果并继续回答
+- 发送按钮 fallback：Enter 键模拟失败时自动点击发送按钮
+- 面板显示版本号
+
+### Changed
+- XHR hook + fetch hook 双重拦截，覆盖 DeepSeek 全部请求方式
+- 合并「连接服务器」和「刷新工具列表」为单一按钮
+- 清理 debug 日志，console 只保留关键信息
+
 ## [1.0.0-mcp] - 2025-04-25
 
 ### Added
