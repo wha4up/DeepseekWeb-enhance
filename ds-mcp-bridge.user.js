@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         DS MCP Bridge
 // @namespace    https://github.com/calendar0917/ds-enhance
-// @version      1.1.0
+// @version      1.2.0
 // @description  让 DeepSeek Chat 调用本地 MCP 工具（Shell、搜索等）
 // @author       ds-enhance
 // @match        https://chat.deepseek.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
@@ -150,116 +151,114 @@
   const callHistory = [];
 
   // ═══════════════════════════════════════════════════════════════
-  //  SSE Interceptor + Request Injection
+  //  XHR Hook — request injection only
+  //  Response is read via DOM observer instead.
   // ═══════════════════════════════════════════════════════════════
-  const originalFetch = window.fetch;
   const TOOL_CALL_RE = /```mcp:(\w+)\n([\s\S]*?)```/g;
 
-  window.fetch = async function (...args) {
-    const url = (typeof args[0] === 'string') ? args[0] : args[0]?.url;
+  function injectHint(bodyStr) {
+    if (!toolRegistry.length || !bodyStr) return bodyStr;
+    try {
+      const parsed = JSON.parse(bodyStr);
+      const hint = buildToolHint();
+      let injected = false;
 
-    // ── Inject tool hint into outgoing request ──
-    if (url && url.includes('/api/v0/chat/completion') && args[1]?.body && toolRegistry.length) {
-      try {
-        const body = JSON.parse(args[1].body);
-        const hint = buildToolHint();
-        // Inject into prompt field (DeepSeek web uses `prompt`, not `messages`)
-        if (body.prompt && !body.prompt.includes('[系统指令] 你拥有以下 MCP 工具')) {
-          body.prompt = hint + '\n\n' + body.prompt;
-          args[1].body = JSON.stringify(body);
-          console.log(`${SCRIPT_PREFIX} Injected tool hint into request`);
-        }
-        // Also try messages array
-        if (body.messages?.length) {
-          const lastMsg = body.messages[body.messages.length - 1];
-          if (lastMsg.role === 'user' && lastMsg.content && !lastMsg.content.includes('[系统指令] 你拥有以下 MCP 工具')) {
-            lastMsg.content = hint + '\n\n' + lastMsg.content;
-            args[1].body = JSON.stringify(body);
-          }
-        }
-      } catch { /* not JSON body, skip */ }
-    }
-
-    const response = await originalFetch.apply(this, args);
-
-    if (!url || !url.includes('/api/v0/chat/completion')) {
-      return response;
-    }
-
-    // ── Intercept the SSE stream ──
-    const clone = response.clone();
-    const reader = clone.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    const streamState = { fullContent: '', done: false };
-
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          const parts = buffer.split('\n\n');
-          buffer = parts.pop();
-
-          for (const part of parts) {
-            for (const line of part.split('\n')) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') {
-                  streamState.done = true;
-                  onStreamComplete(streamState);
-                } else {
-                  try {
-                    const chunk = JSON.parse(data);
-                    const content = chunk?.choices?.[0]?.delta?.content;
-                    if (content) streamState.fullContent += content;
-                  } catch { /* skip */ }
-                }
-              }
-            }
-          }
-        }
-        if (!streamState.done && streamState.fullContent) {
-          streamState.done = true;
-          onStreamComplete(streamState);
-        }
-      } catch (e) {
-        console.error(`${SCRIPT_PREFIX} SSE read error:`, e);
+      if (parsed.prompt && typeof parsed.prompt === 'string' && !parsed.prompt.includes('[系统指令] 你拥有以下 MCP 工具')) {
+        parsed.prompt = hint + '\n\n' + parsed.prompt;
+        injected = true;
       }
-    })();
+      if (!injected && parsed.messages?.length) {
+        const lastMsg = parsed.messages[parsed.messages.length - 1];
+        const content = lastMsg?.content;
+        if (typeof content === 'string' && !content.includes('[系统指令] 你拥有以下 MCP 工具')) {
+          lastMsg.content = hint + '\n\n' + content;
+          injected = true;
+        } else if (Array.isArray(content)) {
+          const textPart = content.find(p => p.type === 'text');
+          if (textPart && !textPart.text.includes('[系统指令]')) {
+            textPart.text = hint + '\n\n' + textPart.text;
+            injected = true;
+          }
+        }
+      }
 
-    return response;
+      if (injected) {
+        console.log(`${SCRIPT_PREFIX} ✅ Tool hint injected`);
+        return JSON.stringify(parsed);
+      }
+    } catch (e) { /* not JSON */ }
+    return bodyStr;
+  }
+
+  // Hook XHR for request injection
+  const XHRProto = unsafeWindow.XMLHttpRequest.prototype;
+  const origOpen = XHRProto.open;
+  const origSend = XHRProto.send;
+
+  XHRProto.open = function (method, url, ...rest) {
+    this._dseUrl = url;
+    return origOpen.apply(this, [method, url, ...rest]);
+  };
+
+  XHRProto.send = function (body) {
+    const url = this._dseUrl || '';
+    if (url.includes('completion') && body && toolRegistry.length) {
+      body = injectHint(body);
+    }
+    return origSend.apply(this, [body]);
   };
 
   // ═══════════════════════════════════════════════════════════════
-  //  Stream Complete Handler
+  //  DOM Observer — detect tool calls from rendered chat messages
+  //  DeepSeek streams via XHR SSE; responseText is inaccessible
+  //  during the stream. So we watch the DOM for rendered code blocks
+  //  containing mcp:tool_name patterns.
   // ═══════════════════════════════════════════════════════════════
-  function onStreamComplete(state) {
-    const content = state.fullContent;
-    if (!content) return;
+  const executedCalls = new Set(); // dedup: "toolName:argsHash"
 
-    const toolCalls = [];
-    let match;
-    const re = new RegExp(TOOL_CALL_RE.source, 'g');
-    while ((match = re.exec(content)) !== null) {
-      const toolName = match[1];
-      const rawArgs = match[2].trim();
+  function callKey(name, args) {
+    return name + ':' + JSON.stringify(args);
+  }
+
+  function scanForToolCalls(root) {
+    if (!root || !root.querySelectorAll) return;
+
+    // Find code blocks with mcp: prefix (rendered from ```mcp:xxx```)
+    const codeBlocks = root.querySelectorAll('code');
+    for (const block of codeBlocks) {
+      const text = block.textContent || '';
+      const m = text.match(/^mcp:(\w+)\s*\n([\s\S]*)$/);
+      if (!m) continue;
+
+      const toolName = m[1];
+      const rawArgs = m[2].trim();
       let args = {};
       try { args = JSON.parse(rawArgs); }
       catch { args = { input: rawArgs }; }
-      toolCalls.push({ name: toolName, args });
-    }
 
-    if (!toolCalls.length) return;
+      const key = callKey(toolName, args);
+      if (executedCalls.has(key)) continue; // already handled
+      executedCalls.add(key);
 
-    console.log(`${SCRIPT_PREFIX} Detected ${toolCalls.length} tool call(s):`, toolCalls.map(c => c.name));
-    for (const call of toolCalls) {
-      executeToolCall(call.name, call.args);
+      console.log(`${SCRIPT_PREFIX} 🔧 Detected tool call from DOM: ${toolName}`, args);
+      executeToolCall(toolName, args);
     }
   }
+
+  waitForDOM().then(() => {
+    // Debounced scan: collect mutations and scan once after a pause
+    let scanTimer = null;
+    function scheduleScan() {
+      if (scanTimer) clearTimeout(scanTimer);
+      scanTimer = setTimeout(() => scanForToolCalls(document.body), 500);
+    }
+
+    const observer = new MutationObserver(() => scheduleScan());
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Also scan periodically as safety net
+    setInterval(() => scanForToolCalls(document.body), 5000);
+  });
 
   // ═══════════════════════════════════════════════════════════════
   //  Tool Execution
