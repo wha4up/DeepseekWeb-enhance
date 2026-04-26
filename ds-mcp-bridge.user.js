@@ -487,9 +487,9 @@
     #mcp-fab.disconnected{background:#dc2626;box-shadow:0 2px 12px rgba(220,38,38,.4)}
     #mcp-fab.disconnected:hover{box-shadow:0 4px 20px rgba(220,38,38,.6)}
 
-    #mcp-panel{position:fixed;z-index:999998;width:460px;max-height:75vh;background:#16161e;color:#eee;border:1px solid #333;border-radius:14px;box-shadow:0 8px 40px rgba(0,0,0,.6);font-family:system-ui;font-size:14px;display:none;flex-direction:column;overflow:hidden}
+    #mcp-panel{position:fixed;z-index:999998;width:460px;max-height:min(75vh, calc(100vh - 20px));background:#16161e;color:#eee;border:1px solid #333;border-radius:14px;box-shadow:0 8px 40px rgba(0,0,0,.6);font-family:system-ui;font-size:14px;display:none;flex-direction:column;overflow:hidden}
     #mcp-panel.open{display:flex}
-    #mcp-panel .hd{padding:14px 18px;border-bottom:1px solid #2a2a3a;display:flex;align-items:center;justify-content:space-between}
+    #mcp-panel .hd{padding:14px 18px;border-bottom:1px solid #2a2a3a;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
     #mcp-panel .hd h3{margin:0;font-size:15px;font-weight:600}
     #mcp-panel .hd .ver{font-size:11px;color:#666;margin-left:8px}
     #mcp-panel .hd .cls{background:none;border:none;color:#888;font-size:20px;cursor:pointer;padding:0 4px}
@@ -604,8 +604,20 @@
       if (l + 460 > window.innerWidth - 10) l = window.innerWidth - 470;
       if (l < 10) l = 10;
       panel.style.left = l + 'px';
-      panel.style.bottom = (window.innerHeight - r.top + 10) + 'px';
+
+      // Position panel above the fab, but ensure top doesn't go above viewport
+      const b = window.innerHeight - r.top + 10;
+      panel.style.bottom = b + 'px';
       panel.style.top = 'auto';
+
+      // After layout, clamp: if panel top is above viewport, pin to top
+      requestAnimationFrame(() => {
+        const rect = panel.getBoundingClientRect();
+        if (rect.top < 10) {
+          panel.style.top = '10px';
+          panel.style.bottom = 'auto';
+        }
+      });
     }
 
     fab.addEventListener('pointerdown', (e) => {
