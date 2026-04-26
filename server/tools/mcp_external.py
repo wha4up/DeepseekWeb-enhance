@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -54,8 +55,14 @@ class StdioMCPServer:
         """Spawn subprocess and initialize MCP session."""
         try:
             merged_env = {**os.environ, **self.env}
+            cmd = self.command
+            # On Windows, resolve .cmd/.bat wrappers (e.g. npx → npx.cmd)
+            if sys.platform == 'win32':
+                resolved = shutil.which(cmd)
+                if resolved:
+                    cmd = resolved
             self._proc = await asyncio.create_subprocess_exec(
-                self.command, *self.args,
+                cmd, *self.args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
