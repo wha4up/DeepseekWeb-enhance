@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         DS Enhance
-// @namespace    https://github.com/calendar0917/ds-enhance
-// @version      3.2.0
+// @namespace    https://github.com/calendar0917/DeepseekWeb-enhance
+// @version      3.2.2
 // @description  批量删除、Fork 对话、会话分类、搜索、导出、批量重命名、多提示词注入
 // @author       ds-enhance
+// @homepageURL  https://github.com/calendar0917/DeepseekWeb-enhance
+// @icon         https://fe-static.deepseek.com/chat/favicon.svg
 // @match        https://chat.deepseek.com/*
 // @grant        none
 // @run-at       document-start
@@ -33,19 +35,77 @@
     return single ? [single] : [];
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  //  对话切换监控与指纹记忆机制
+  // ═══════════════════════════════════════════════════════════════════
+  let lastInjectedSignature = null; // 记录上一次注入的具体内容
+
+  const originalPushState = history.pushState;
+  history.pushState = function(...args) {
+    const newUrl = args[2];
+    if (newUrl) {
+      const oldPath = location.pathname;
+      const newPath = newUrl.toString().startsWith('http')
+          ? new URL(newUrl).pathname
+          : new URL(newUrl, location.origin).pathname;
+
+      if (oldPath === '/' && newPath.startsWith('/s/')) {
+          // 原地获取房间号，不重置
+      } else if (oldPath !== newPath) {
+          // 切换了房间，重置指纹
+          lastInjectedSignature = null;
+      }
+    }
+    return originalPushState.apply(this, args);
+  };
+
+  window.addEventListener('popstate', () => {
+    lastInjectedSignature = null;
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  注入与修改请求逻辑
+  // ═══════════════════════════════════════════════════════════════════
+
   function modifyRequest(bodyStr) {
     const enabled = getEnabledPrompts();
-    if (!enabled.length || !bodyStr) return bodyStr;
+    // 生成当前所有开启状态的提示词的“指纹”
+    const currentSignature = enabled.join('\n\n');
+
+    // 逻辑分支 1：如果当前关闭了所有提示词，清空指纹记录，直接放行
+    if (!currentSignature) {
+      lastInjectedSignature = null;
+      return bodyStr;
+    }
+
+    if (!bodyStr) return bodyStr;
     if (bodyStr.includes(CUSTOM_PROMPT_MARKER)) return bodyStr;
+
+    // 逻辑分支 2：对比指纹。如果当前要发的提示词和上次发的一模一样，直接切断
+    if (lastInjectedSignature === currentSignature) {
+      return bodyStr;
+    }
+
+    // 逻辑分支 3：是全新的提示词，或者是改了字的提示词，执行注入
     try {
       const parsed = JSON.parse(bodyStr);
-      const tagged = `${CUSTOM_PROMPT_MARKER}\n${enabled.join('\n\n')}`;
+      const tagged = `${CUSTOM_PROMPT_MARKER}\n${currentSignature}`;
+      let injected = false;
+
+      // 后置注入逻辑
       if (parsed.prompt && typeof parsed.prompt === 'string') {
-        parsed.prompt = tagged + '\n\n' + parsed.prompt;
-        return JSON.stringify(parsed);
+        parsed.prompt = parsed.prompt + '\n\n' + tagged;
+        injected = true;
       }
       if (parsed.messages?.length) {
-        parsed.messages.unshift({ role: 'system', content: tagged });
+        const lastIdx = parsed.messages.length - 1;
+        parsed.messages[lastIdx].content = parsed.messages[lastIdx].content + '\n\n' + tagged;
+        injected = true;
+      }
+
+      if (injected) {
+        // 注入成功后，更新指纹记录为当前提示词
+        lastInjectedSignature = currentSignature;
         return JSON.stringify(parsed);
       }
     } catch { /* not JSON */ }
@@ -206,7 +266,7 @@
   function toast(msg, type = 'info') {
     const colors = { info: '#2a2a3e', success: '#0d3320', error: '#3d0f0f' };
     const el = document.createElement('div');
-    el.style.cssText = `position:fixed;bottom:24px;right:24px;z-index:1000001;background:${colors[type]};color:#eee;padding:12px 22px;border-radius:10px;font-size:14px;box-shadow:0 4px 20px rgba(0,0,0,.5);font-family:system-ui;transition:opacity .3s;`;
+    el.style.cssText = `position:fixed;bottom:24px;right:24px;z-index:2000001;background:${colors[type]};color:#eee;padding:12px 22px;border-radius:10px;font-size:14px;box-shadow:0 4px 20px rgba(0,0,0,.5);font-family:system-ui;transition:opacity .3s;`;
     el.textContent = msg;
     document.body.appendChild(el);
     setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3500);
@@ -325,6 +385,39 @@
     .dse-pcard-body textarea{width:100%;padding:8px;border-radius:8px;border:1px solid #444;background:#16161e;color:#eee;font-size:12px;resize:vertical;min-height:60px;box-sizing:border-box;outline:none}
     .dse-pcard-body textarea:focus{border-color:#7aa2f7}
     .dse-pcard-body .pfoot{display:flex;justify-content:flex-end;gap:6px;margin-top:6px}
+
+
+    /* 独立挂载的弹窗（绝不在输入框内部以防被遮挡） */
+    .dse-global-dropdown {
+      position: fixed;
+      background: #2c2c2e;
+      border: rgba(255,255,255,.06);
+      border-radius: 8px;
+      padding: 4px; /* 压缩选项整体面板上下间隔 */
+      display: none;
+      flex-direction: column;
+      gap: 2px; /* 压缩选项之间的间隔 */
+      min-width: 160px;
+      max-width: 280px;
+      box-shadow: 0 4px 20px rgba(0,0,0,.5);
+      z-index: 2147483647;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .dse-global-dropdown.open { display: flex; }
+    .dse-dropdown-item {
+      padding: 6px 8px; /* 压缩单个选项的高度 */
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #eee;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: background 0.15s;
+    }
+    .dse-dropdown-item:hover { background: #2a2a3a; }
+    .dse-dropdown-item.active { color: #7aa2f7; background: #1a2a4a; }
   `;
   document.head.appendChild(style);
 
@@ -1120,10 +1213,11 @@
       const id = Number(card.dataset.id);
 
       card.querySelector('.p-toggle').onchange = (e) => {
-        const prompts = loadPrompts();
-        const p = prompts.find(x => x.id === id);
-        if (p) { p.enabled = e.target.checked; savePrompts(prompts); }
+        const pList = loadPrompts();
+        const p = pList.find(x => x.id === id);
+        if (p) { p.enabled = e.target.checked; savePrompts(pList); }
         card.classList.toggle('disabled', !e.target.checked);
+        InlinePromptUI.update();
       };
 
       card.querySelector('.p-edit').onclick = () => {
@@ -1138,9 +1232,9 @@
           nameEl.contentEditable = 'false';
           const newName = nameEl.textContent.trim() || '未命名';
           nameEl.textContent = newName;
-          const prompts = loadPrompts();
-          const p = prompts.find(x => x.id === id);
-          if (p) { p.name = newName; savePrompts(prompts); }
+          const pList = loadPrompts();
+          const p = pList.find(x => x.id === id);
+          if (p) { p.name = newName; savePrompts(pList); InlinePromptUI.update(); }
         };
         nameEl.onblur = done;
         nameEl.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); nameEl.blur(); } };
@@ -1148,17 +1242,17 @@
 
       card.querySelector('.p-del').onclick = () => {
         if (!confirm('确定删除该提示词？')) return;
-        const prompts = loadPrompts().filter(x => x.id !== id);
-        savePrompts(prompts);
+        savePrompts(loadPrompts().filter(x => x.id !== id));
         renderPromptCards();
+        InlinePromptUI.update();
         toast('提示词已删除', 'info');
       };
 
       card.querySelector('.p-save-content').onclick = () => {
         const val = card.querySelector('.p-content').value.trim();
-        const prompts = loadPrompts();
-        const p = prompts.find(x => x.id === id);
-        if (p) { p.content = val; savePrompts(prompts); }
+        const pList = loadPrompts();
+        const p = pList.find(x => x.id === id);
+        if (p) { p.content = val; savePrompts(pList); }
         toast('内容已保存', 'success');
         card.querySelector('.dse-pcard-body').classList.remove('open');
       };
@@ -1184,7 +1278,184 @@
 
   renderPromptCards();
 
-  console.log('[DSE] DeepSeek Chat Enhance v3.2 loaded');
+  // ═══════════════════════════════════════════════════════════════════
+  //  内嵌原生风格自定义提示词切换按钮
+  // ═══════════════════════════════════════════════════════════════════
+  const InlinePromptUI = {
+    btnId: 'dse-inline-btn',
+    dropdownId: 'dse-global-dropdown',
+
+    // 初始化全局无遮挡下拉菜单
+    init() {
+      if (!document.getElementById(this.dropdownId)) {
+        const dp = document.createElement('div');
+        dp.id = this.dropdownId;
+        dp.className = 'dse-global-dropdown';
+        document.body.appendChild(dp);
+
+        document.addEventListener('click', (e) => {
+          const btn = document.getElementById(this.btnId);
+          if (dp.classList.contains('open') && !dp.contains(e.target) && (!btn || !btn.contains(e.target))) {
+            dp.classList.remove('open');
+          }
+        });
+      }
+    },
+
+    // 寻找原生按钮并动态挂载/矫正位置
+    mount() {
+      const buttons = Array.from(document.querySelectorAll('div[role="button"].ds-toggle-button'));
+      const anchorBtn = buttons.find(b =>
+        b.textContent.includes('智能搜索') ||
+        b.textContent.includes('深度思考') ||
+        b.textContent.includes('联网搜索') ||
+        b.textContent.includes('DeepThink')
+      );
+      if (!anchorBtn) return;
+
+      const container = anchorBtn.parentElement;
+      let btn = document.getElementById(this.btnId);
+
+      if (!btn) {
+        btn = document.createElement('div');
+        btn.id = this.btnId;
+        btn.className = 'ds-atom-button f79352dc ds-toggle-button ds-toggle-button--md';
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
+        btn.innerHTML = `
+          <div class="ds-icon ds-atom-button__icon" style="font-size: 14px; width: 14px; height: 14px; margin-right: 0px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"></path>
+            </svg>
+          </div>
+          <span><span class="_6dbc175 dse-btn-text" style="color: inherit;">指令选择</span></span>
+          <div class="ds-focus-ring"></div>
+        `;
+
+        btn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.toggleDropdown(btn);
+        };
+      }
+
+      // 动态位置矫正：保证我们的按钮永远在所有原生 Toggle 按钮的最后面
+      const nativeToggles = Array.from(container.children).filter(c => c.classList.contains('ds-toggle-button') && c.id !== this.btnId);
+      const lastNative = nativeToggles[nativeToggles.length - 1];
+
+      if (lastNative && lastNative.nextSibling !== btn) {
+        container.insertBefore(btn, lastNative.nextSibling);
+      } else if (!lastNative && !container.contains(btn)) {
+        container.appendChild(btn);
+      }
+
+      this.update();
+    },
+
+    // 仅用于更新按钮的文案与激活状态
+    update() {
+      const btn = document.getElementById(this.btnId);
+      if (!btn) return;
+
+      const textEl = btn.querySelector('.dse-btn-text');
+
+      const prompts = loadPrompts();
+      const enabled = prompts.filter(p => p.enabled);
+
+      if (enabled.length === 0) {
+        if (btn.classList.contains('ds-toggle-button--selected')) {
+          btn.classList.remove('ds-toggle-button--selected');
+        }
+        if (textEl.textContent !== '指令选择') {
+          textEl.textContent = '指令选择';
+        }
+      } else {
+        if (!btn.classList.contains('ds-toggle-button--selected')) {
+          btn.classList.add('ds-toggle-button--selected');
+        }
+        const newText = enabled.length === 1 ? enabled[0].name : `${enabled[0].name}等(${enabled.length})`;
+        if (textEl.textContent !== newText) {
+          textEl.textContent = newText;
+        }
+      }
+    },
+
+    // 展开/收起绝对定位的全局菜单
+    toggleDropdown(btnEl) {
+      const dp = document.getElementById(this.dropdownId);
+      if (!dp) return;
+
+      if (dp.classList.contains('open')) {
+        dp.classList.remove('open');
+        return;
+      }
+
+      this.renderDropdownContent(dp);
+      const rect = btnEl.getBoundingClientRect();
+      dp.style.left = `${rect.left}px`;
+      dp.style.bottom = `${window.innerHeight - rect.top + 8}px`; // 动态定位在按钮正上方
+      dp.classList.add('open');
+    },
+
+    // 渲染菜单内容
+    renderDropdownContent(dp) {
+      const prompts = loadPrompts();
+      dp.innerHTML = '';
+      if (!prompts.length) {
+        dp.innerHTML = '<div style="padding:8px 12px;color:#888;font-size:13px;text-align:center;">暂无提示词</div>';
+      } else {
+        prompts.forEach(p => {
+          const item = document.createElement('div');
+          item.className = `dse-dropdown-item ${p.enabled ? 'active' : ''}`;
+          item.innerHTML = `
+            <div style="width:14px;height:14px;border-radius:4px;border:1px solid ${p.enabled ? '#7aa2f7' : '#555'};background:${p.enabled ? '#7aa2f7' : 'transparent'};display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+              ${p.enabled ? '<svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2 6L5 9L10 3" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' : ''}
+            </div>
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.content)}">${esc(p.name)}</span>
+          `;
+          item.onclick = (e) => {
+            e.stopPropagation();
+            p.enabled = !p.enabled;
+            savePrompts(prompts);
+            renderPromptCards();
+            this.renderDropdownContent(dp); // 重新渲染下拉列表
+            this.update(); // 更新输入框按钮文字与颜色状态
+          };
+          dp.appendChild(item);
+        });
+      }
+
+      const div = document.createElement('div');
+      div.style.cssText = 'height:1px;background:#333;margin:4px 0;';
+      dp.appendChild(div);
+
+      const setBtn = document.createElement('div');
+      setBtn.className = 'dse-dropdown-item';
+      setBtn.innerHTML = `<span style="text-align:center;width:100%;color:#aaa;">⚙️ 管理提示词</span>`;
+      setBtn.onclick = (e) => {
+        e.stopPropagation();
+        dp.classList.remove('open');
+        document.getElementById('dse-panel').classList.add('open');
+        posPanel();
+      };
+      dp.appendChild(setBtn);
+    }
+  };
+
+  // 初始化与监听器
+  InlinePromptUI.init();
+
+  // 添加防抖的 MutationObserver，监控并自动矫正节点位置
+  let mountTimer = null;
+  const domObserver = new MutationObserver(() => {
+    if (mountTimer) clearTimeout(mountTimer);
+    mountTimer = setTimeout(() => {
+      InlinePromptUI.mount();
+    }, 50);
+  });
+  domObserver.observe(document.body, { childList: true, subtree: true });
+
+  console.log('[DSE] DeepSeek Chat Enhance v3.2.2 loaded');
 
   }); // end waitForDOM
 })();
